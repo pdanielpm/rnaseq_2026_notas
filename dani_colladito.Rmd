@@ -1,0 +1,366 @@
+---
+title: "Análisis de expresión diferencial en DLBCL (TCGA/recount3): Alive vs Dead"
+author: "García González Carlos"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    latex_engine: pdflatex
+geometry: margin=1in
+---
+
+# Introducción
+
+El linfoma difuso de células B grandes (DLBCL) es la neoplasia linfoide agresiva más frecuente en adultos y se caracteriza por una marcada heterogeneidad biológica y clínica. Estudios de perfilamiento transcriptómico han demostrado que, aun dentro de una misma categoría histopatológica, existen programas de expresión génica distintos asociados con el estado de diferenciación de la célula tumoral, la proliferación y la respuesta del hospedero, los cuales impactan el pronóstico. En particular, la clasificación por “cell-of-origin” (p. ej., GCB vs ABC) y firmas transcriptómicas relacionadas con microambiente e inmunidad ayudan a explicar parte de la variación interpaciente y su relación con la supervivencia. [Alizadeh et al., 2000; Rosenwald et al., 2002; Chapuy et al., 2018]. 
+
+En este documento se analiza expresión diferencial a partir de datos públicos de RNA-seq del consorcio TCGA, accesibles vía recount3, comparando pacientes *alive* vs *dead*. Además, se explora el comportamiento del gen **SPN** (que codifica CD43/sialoforina), dada la evidencia de que CD43 puede contribuir a fenotipos pro-tumorales en distintos contextos (adhesión, crecimiento y señalización) y, de manera relevante para DLBCL, su expresión inmunohistoquímica se ha asociado con peores desenlaces clínicos.  
+
+**Importancia de CD43 (SPN).** CD43 es una sialomucina transmembranal abundante en células hematopoyéticas, pero también se ha descrito su expresión/función en contextos tumorales y su potencial contribución a procesos como adhesión célula–mesotelio y crecimiento tumoral. En DLBCL, varios estudios reportan que CD43 positivo se asocia con menores tasas de respuesta completa y menor supervivencia global/event-free, y que coexpresión CD5/CD43 identifica subgrupos particularmente adversos.  
+
+# Objetivo
+
+1) Identificar genes diferencialmente expresados entre *alive* vs *dead* en el proyecto **DLBC** (TCGA/recount3) usando **edgeR**.  
+2) Visualizar los resultados (volcán, MA, heatmap de genes más variables).  
+3) Evaluar **SPN/CD43**: distribución por estado vital, asociación con supervivencia (Kaplan–Meier) y su relación con la variación transcriptómica global.
+
+# Métodos
+
+```{r setup, include=FALSE}
+options(
+  recount3_url = "https://recount-opendata.s3.amazonaws.com/recount3/release"
+)
+```
+
+```{r setup1, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.align = "center", fig.width = 9, fig.height = 5
+)
+
+suppressPackageStartupMessages({
+  library(recount3)
+  library(SummarizedExperiment)
+  library(Matrix)
+
+  library(edgeR)
+  library(limma)
+  library(ggplot2)
+  library(ggpubr)
+  library(matrixStats)
+  library(pheatmap)
+
+  library(survival)
+  library(survminer)
+})
+```
+
+### Descarga y construcción del RSE (DLBC)
+
+```{r}
+human_projects <- available_projects()
+
+project_info <- subset(
+  human_projects,
+  project == "DLBC" & project_type == "data_sources" & project_home == "data_sources/tcga"
+)
+
+rse_DLBC <- create_rse(project_info)
+
+# counts (recount3) -> compute_read_counts
+assay(rse_DLBC, "counts") <- compute_read_counts(rse_DLBC)
+
+cts <- assay(rse_DLBC, "counts")
+cd  <- as.data.frame(colData(rse_DLBC))
+rd  <- as.data.frame(rowData(rse_DLBC))
+
+cat("Muestras iniciales:", ncol(cts), "\n")
+cat("Genes iniciales:", nrow(cts), "\n")
+```
+
+### Filtrado: vital_status + QC de conteos + filtro de genes
+
+```{r}
+## --- detectar columna de estado vital (robusto)
+vital_candidates <- grep(
+  "vital|vital_status|deceased|dead|alive",
+  names(cd),
+  ignore.case = TRUE,
+  value = TRUE
+)
+
+if (length(vital_candidates) == 0) {
+  stop("No se encontraron columnas tipo vital_status en colData(). Revisa names(cd).")
+}
+
+# Elegir la columna más informativa (por defecto, la primera)
+vital_col <- vital_candidates[1]
+cat("Usando columna vital:", vital_col, "\n")
+print(table(cd[[vital_col]], useNA = "ifany"))
+
+## --- remover NA / unknown / not reported
+bad_vital <- is.na(cd[[vital_col]]) |
+  trimws(tolower(as.character(cd[[vital_col]]))) %in% c("", "na", "nan", "not reported", "unknown")
+
+keep_vital <- !bad_vital
+
+rse_vital <- rse_DLBC[, keep_vital]
+cts_vital <- assay(rse_vital, "counts")
+cd_vital  <- as.data.frame(colData(rse_vital))
+
+cat("Muestras tras filtrar vital:", ncol(cts_vital), "\n")
+print(table(cd_vital[[vital_col]], useNA = "ifany"))
+
+## --- QC por muestra
+lib_size  <- Matrix::colSums(cts_vital)
+genes_det <- Matrix::colSums(cts_vital > 0)
+zero_frac <- Matrix::colMeans(cts_vital == 0)
+
+qc <- data.frame(
+  sample = colnames(cts_vital),
+  lib_size = as.numeric(lib_size),
+  genes_detected = as.numeric(genes_det),
+  zero_fraction = as.numeric(zero_frac)
+)
+
+summary(qc)
+
+min_lib   <- 5e6
+min_genes <- 10000
+max_zeros <- 0.85
+
+keep_qc <- with(qc, lib_size >= min_lib & genes_detected >= min_genes & zero_fraction <= max_zeros)
+cat("Muestras que pasan QC:", sum(keep_qc), "de", length(keep_qc), "\n")
+
+rse_qc <- rse_vital[, keep_qc]
+cts_qc <- assay(rse_qc, "counts")
+
+## --- filtro de genes (>=10 counts en >=10% de muestras)
+n <- ncol(cts_qc)
+keep_gene <- Matrix::rowSums(cts_qc >= 10) >= ceiling(0.10 * n)
+
+rse_filt <- rse_qc[keep_gene, ]
+cts_final <- assay(rse_filt, "counts")
+coldata_final <- as.data.frame(colData(rse_filt))
+rowdata_final <- as.data.frame(rowData(rse_filt))
+
+cat("Genes finales:", nrow(cts_final), "\n")
+cat("Muestras finales:", ncol(cts_final), "\n")
+```
+
+# Resultados
+
+### Expresión diferencial Alive vs Dead con limma-voom (edgeR)
+
+```{r}
+## --- mapear alive/dead de forma estricta
+v <- tolower(trimws(as.character(coldata_final[[vital_col]])))
+
+group <- ifelse(v %in% c("alive","living"), "alive",
+         ifelse(v %in% c("dead","deceased"), "dead", NA))
+
+keep_ad <- !is.na(group)
+cts_ad <- cts_final[, keep_ad]
+cd_ad  <- coldata_final[keep_ad, , drop = FALSE]
+group  <- factor(group[keep_ad], levels = c("alive","dead"))
+
+cat("Tabla alive/dead:\n")
+print(table(group))
+
+
+y <- DGEList(counts = cts_ad, group = group)
+keep_gene2 <- filterByExpr(y, group = group)
+y <- y[keep_gene2, , keep.lib.sizes = FALSE]
+y <- calcNormFactors(y, method = "TMM")
+
+design <- model.matrix(~ 0 + group)
+colnames(design) <- levels(group)
+
+
+v <- voom(y, design, plot = TRUE)
+fit <- lmFit(v, design)
+
+# contraste: dead vs alive (logFC>0 => más alto en dead)
+contr <- makeContrasts(DeadVsAlive = dead - alive, levels = design)
+fit.contr <- contrasts.fit(fit, contr)
+
+fit.eb <- eBayes(fit.contr)
+res <- topTable(fit.eb, coef = "DeadVsAlive", number = Inf, sort.by = "P")
+
+# detect adjusted p-value / FDR column robustly and order by it
+fdr_candidates <- c("FDR", "adj.P.Val", "adj.P.Value", "padj", "p.adjust", "qvalue", "P.Value")
+fdr_col <- intersect(fdr_candidates, colnames(res))[1]
+
+if (is.na(fdr_col)) {
+  stop("No FDR/adjusted-p column found in res; available columns: ", paste(colnames(res), collapse = ", "))
+}
+
+# ensure numeric and order ascending (smallest FDR first)
+res[[fdr_col]] <- as.numeric(res[[fdr_col]])
+res <- res[order(res[[fdr_col]]), , drop = FALSE]
+
+# return the top table (useful object)
+out <- head(res, 20)
+out
+```
+
+##### Volcano Plot
+```{r}
+volcanoplot(fit.eb, coef = "DeadVsAlive", highlight = 10, names = res$gene, 
+            main = "Expresión diferencial Alive vs Dead (DLBC, limma)")
+```
+
+##### MA Plot
+```{r}
+A <- res$AveExpr
+M <- res$logFC
+
+plot(
+  A, M,
+  pch = 16, cex = 0.45,
+  xlab = "Average expression ()",
+  ylab = "logFC (dead vs alive)",
+  ylim = c(-5, 5)
+)
+abline(h = 0, col = "red")
+```
+
+##### Heatmap
+```{r}
+logcpm <- v$E
+
+top_n <- 20
+vars <- matrixStats::rowVars(logcpm)
+top_idx <- order(vars, decreasing = TRUE)[seq_len(min(top_n, nrow(logcpm)))]
+mat <- logcpm[top_idx, , drop = FALSE]
+
+## renombrar filas con símbolo si existe
+if (!is.null(gene_col)) {
+  labs <- rowdata_final[[gene_col]][match(rownames(mat), rownames(rowdata_final))]
+  labs[is.na(labs) | labs == ""] <- rownames(mat)[is.na(labs) | labs == ""]
+  rownames(mat) <- make.unique(labs)
+}
+
+## anotar columnas
+ann_col <- data.frame(vital_status = group)
+rownames(ann_col) <- colnames(mat)
+
+## ordenar por grupo
+ord <- order(group)
+mat <- mat[, ord, drop = FALSE]
+ann_col <- ann_col[ord, , drop = FALSE]
+
+pheatmap(
+  mat,
+  scale = "row",
+  show_colnames = FALSE,
+  annotation_col = ann_col,
+  clustering_distance_rows = "correlation",
+  clustering_distance_cols = "correlation",
+  main = paste0("Top ", top_n, " genes más variables (logCPM; z-score por gen)")
+)
+```
+
+### SPN (CD43): distribución, supervivencia y relación con transcriptoma
+
+##### Violin plot SPN vs estado vital
+```{r}
+## localizar SPN por símbolo
+if (is.null(gene_col)) stop("No hay columna de símbolo en rowData para ubicar SPN.")
+
+spn_row <- which(rowdata_final[[gene_col]] == "SPN")
+if (length(spn_row) == 0) stop("SPN no encontrado en rowData (símbolos).")
+
+SPN_expr <- as.numeric(logcpm[spn_row, ])
+
+df_spn <- data.frame(
+  status = group,
+  expr = SPN_expr
+)
+df_spn <- df_spn[!is.na(df_spn$status), ]
+
+ggplot(df_spn, aes(status, expr, fill = status)) +
+  geom_violin(trim = FALSE, alpha = 0.6) +
+  geom_boxplot(width = 0.15, outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(width = 0.10, alpha = 0.6, size = 1.2) +
+  stat_compare_means(method = "wilcox.test") +
+  theme_classic() +
+  labs(
+    title = "Expresión de SPN (CD43) vs estado vital",
+    y = "logCPM (TMM)",
+    x = ""
+  )
+```
+
+##### Supervivencia (Kaplan–Meier) por SPN High vs Low
+```{r}
+## columnas típicas TCGA (recount3 puede variar; usamos las que tú listaste que sí existen)
+d_death <- suppressWarnings(as.numeric(as.character(coldata_final$tcga.gdc_cases.diagnoses.days_to_death)))
+d_fu    <- suppressWarnings(as.numeric(as.character(coldata_final$tcga.gdc_cases.diagnoses.days_to_last_follow_up)))
+
+time <- ifelse(!is.na(d_death), d_death, d_fu)
+event <- ifelse(group == "dead", 1, 0)
+
+expr_group <- ifelse(SPN_expr > median(SPN_expr, na.rm = TRUE), "High", "Low")
+expr_group <- factor(expr_group, levels = c("Low", "High"))
+
+surv_df <- data.frame(
+  time = as.numeric(time),
+  event = as.integer(event),
+  expr_group = expr_group
+)
+
+surv_df <- surv_df[complete.cases(surv_df), ]
+surv_df <- surv_df[surv_df$time >= 0, ]
+
+fit <- survfit(Surv(time, event) ~ expr_group, data = surv_df)
+
+ggsurvplot(
+  fit,
+  data = surv_df,
+  pval = TRUE,
+  risk.table = TRUE,
+  conf.int = FALSE,
+  ggtheme = theme_classic(),
+  title = "Overall survival por SPN (High vs Low)"
+)
+```
+
+##### SPN vs transcriptome variation
+```{r}
+pca <- prcomp(t(logcpm), scale. = TRUE)
+
+df_pc <- data.frame(
+  PC1 = pca$x[, 1],
+  PC2 = pca$x[, 2],
+  SPN = SPN_expr,
+  status = group
+)
+
+ggplot(df_pc, aes(SPN, PC1, color = status)) +
+  geom_point(size = 2.7) +
+  theme_classic() +
+  labs(
+    title = "Relación entre SPN y el eje principal de variación transcriptómica (PC1)",
+    x = "SPN (logCPM)",
+    y = "PC1"
+  )
+```
+
+# Discusión y conclusión
+
+En este análisis (DLBC/TCGA vía recount3), la comparación alive vs dead con edgeR identifica un conjunto de genes con evidencia de expresión diferencial (visualizable en el volcán y el MA). Aun cuando el desenlace clínico final está influido por múltiples covariables (edad, IPI, tratamiento, subtipo molecular, carga tumoral, etc.), estos resultados ofrecen un punto de partida para formular hipótesis sobre programas de expresión asociados a mortalidad en este cohort.
+
+Top genes más variables (heatmap). Los genes de mayor variabilidad en DLBCL suelen agruparse en categorías biológicamente esperables:
+
+Genes ligados a sexo (p. ej., XIST/TSIX y genes del cromosoma Y como RPS4Y1, EIF1AY, UTY, DDX3Y, KDM5D), que reflejan una fuente fuerte de variación inter-individuo no necesariamente tumoral.
+
+Genes de inmunoglobulinas/BCR (p. ej., segmentos IGHV/IGKV/IGLV o genes asociados a plasmablastos), que capturan heterogeneidad de la identidad B, estado de activación y/o composición tumoral–microambiente.
+
+Antígenos tipo cancer-testis o programas de proliferación/estrés, que pueden emerger en subgrupos específicos y son consistentes con la heterogeneidad molecular descrita en DLBCL por estudios de perfilamiento transcriptómico y genómico. En conjunto, este patrón concuerda con que DLBCL no es una entidad homogénea, sino un espectro de estados biológicos con consecuencias pronósticas.
+
+SPN/CD43. En tus gráficas, SPN no muestra una diferencia marcada entre alive y dead (p=0.48 por Wilcoxon) y la separación por mediana para Kaplan–Meier tampoco produce una diferencia significativa (p=0.48). Esto no contradice la literatura clínica, porque:
+
+muchos estudios que vinculan CD43 a peor pronóstico en DLBCL evalúan proteína por IHQ (no necesariamente correlaciona linealmente con RNA a nivel bulk),
+
+y controlan (o estratifican) por covariables pronósticas y subtipos.
+Aun así, la razón para mirar CD43/SPN es sólida: hay evidencia de roles pro-tumorales de CD43 en adhesión/crecimiento y, específicamente en DLBCL, se ha reportado que CD43 positivo se asocia con peor EFS/OS; además, la coexpresión CD5/CD43 define un subgrupo de pronóstico especialmente adverso.
